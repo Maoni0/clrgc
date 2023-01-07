@@ -1,0 +1,142 @@
+From eb6ea65885ca17b2f2f9ca94ca4dd3e8f653799e Mon Sep 17 00:00:00 2001
+From: Maoni0 <maoni@microsoft.com>
+Date: Fri, 6 Jan 2023 21:39:14 -0800
+Subject: [PATCH] record ac info and induce an AV when ac is too large
+
+---
+ src/coreclr/gc/gc.cpp   | 48 +++++++++++++++++++++++++++++++++++++++++
+ src/coreclr/gc/gcpriv.h | 27 ++++++++++++++++++++++-
+ 2 files changed, 74 insertions(+), 1 deletion(-)
+
+diff --git a/src/coreclr/gc/gc.cpp b/src/coreclr/gc/gc.cpp
+index 41731d28dcb..e8980890dd9 100644
+--- a/src/coreclr/gc/gc.cpp
++++ b/src/coreclr/gc/gc.cpp
+@@ -2402,6 +2402,11 @@ int         gc_heap::spinlock_info_index = 0;
+ spinlock_info gc_heap::last_spinlock_info[max_saved_spinlock_info + 8];
+ #endif //SPINLOCK_HISTORY
+ 
++#ifdef ALLOC_THREAD_HISTORY
++int gc_heap::allocating_thread_info_index = 0;
++allocating_thread_info gc_heap::saved_allocating_thread_info[max_saved_allocating_thread_info];
++#endif //ALLOC_THREAD_HISTORY
++
+ uint32_t    gc_heap::fgn_maxgen_percent = 0;
+ size_t      gc_heap::fgn_last_alloc = 0;
+ 
+@@ -14242,6 +14247,10 @@ gc_heap::init_gc_heap (int h_number)
+     memset (last_spinlock_info, 0, sizeof(last_spinlock_info));
+ #endif //SPINLOCK_HISTORY
+ 
++#ifdef ALLOC_THREAD_HISTORY
++    allocating_thread_info_index = 0;
++#endif //ALLOC_THREAD_HISTORY
++
+     // initialize per heap members.
+ #ifndef USE_REGIONS
+     ephemeral_low = (uint8_t*)1;
+@@ -15846,10 +15855,49 @@ uint16_t allocator::count_largest_items (etw_bucket_info* bucket_info,
+ }
+ #endif //FEATURE_EVENT_TRACE
+ 
++uint8_t* g_ptr = NULL;
++
++#pragma optimize("", off)
++void induce_av()
++{
++    printf ("derefing null global ptr %d!!!\n", (int)(*g_ptr));
++}
++#pragma optimize("", on)
++
+ void gc_heap::adjust_limit_clr (uint8_t* start, size_t limit_size, size_t size,
+                                 alloc_context* acontext, uint32_t flags,
+                                 heap_segment* seg, int align_const, int gen_number)
+ {
++#ifdef ALLOC_THREAD_HISTORY
++    if (gen_number == 0)
++    {
++        allocating_thread_info* current_info = &saved_allocating_thread_info[allocating_thread_info_index];
++
++        current_info->alloc_ptr = acontext->alloc_ptr;
++        current_info->alloc_limit = acontext->alloc_limit;
++        current_info->alloc_allocated = alloc_allocated;
++        current_info->start = start;
++        current_info->limit_size = limit_size;
++        current_info->ephemeral_seg = ephemeral_heap_segment;
++        current_info->gc_index = VolatileLoadWithoutBarrier(&settings.gc_index);
++        current_info->tid = GCToOSInterface::GetCurrentThreadIdForLogging();
++
++        allocating_thread_info_index++;
++
++        if (limit_size > (loh_size_threshold * 2))
++        {
++            induce_av();
++        }
++
++        assert (allocating_thread_info_index <= max_saved_allocating_thread_info);
++
++        if (allocating_thread_info_index >= max_saved_allocating_thread_info)
++        {
++            allocating_thread_info_index = 0;
++        }
++    }
++#endif //ALLOC_THREAD_HISTORY
++
+     bool uoh_p = (gen_number > 0);
+     GCSpinLock* msl = uoh_p ? &more_space_lock_uoh : &more_space_lock_soh;
+     uint64_t& total_alloc_bytes = uoh_p ? total_alloc_bytes_uoh : total_alloc_bytes_soh;
+diff --git a/src/coreclr/gc/gcpriv.h b/src/coreclr/gc/gcpriv.h
+index dac6e3dbd32..bfca090009e 100644
+--- a/src/coreclr/gc/gcpriv.h
++++ b/src/coreclr/gc/gcpriv.h
+@@ -52,7 +52,7 @@ inline void FATAL_GC_ERROR()
+ // This means any empty regions can be freely used for any generation. For
+ // Server GC we will balance regions between heaps.
+ // For now disable regions for StandAlone GC, NativeAOT and MacOS builds
+-#if defined (HOST_64BIT) && !defined (BUILD_AS_STANDALONE) && !defined(__APPLE__) && !defined(FEATURE_NATIVEAOT)
++#if defined (HOST_64BIT) && defined (BUILD_AS_STANDALONE) && !defined(__APPLE__) && !defined(FEATURE_NATIVEAOT)
+ #define USE_REGIONS
+ #endif //HOST_64BIT && BUILD_AS_STANDALONE
+ 
+@@ -1064,6 +1064,20 @@ struct spinlock_info
+     bool loh_p;
+ };
+ 
++struct allocating_thread_info
++{
++    // these are from the ac passed to the adjust_limit_clr call
++    uint8_t* alloc_ptr;
++    uint8_t* alloc_limit;
++
++    uint8_t* alloc_allocated;
++    uint8_t* start;
++    size_t limit_size;
++    heap_segment* ephemeral_seg;
++    size_t gc_index;
++    uint64_t tid;
++};
++
+ #define HS_CACHE_LINE_SIZE 128
+ 
+ #ifdef SNOOP_STATS
+@@ -2247,6 +2261,17 @@ protected:
+ 
+     PER_HEAP
+     void adjust_limit (uint8_t* start, size_t limit_size, generation* gen);
++
++#define ALLOC_THREAD_HISTORY
++#define max_saved_allocating_thread_info 64
++#ifdef ALLOC_THREAD_HISTORY
++    PER_HEAP
++    int allocating_thread_info_index;
++
++    PER_HEAP
++    allocating_thread_info saved_allocating_thread_info[max_saved_allocating_thread_info];
++#endif //ALLOC_THREAD_HISTORY
++
+     PER_HEAP
+     void adjust_limit_clr (uint8_t* start, size_t limit_size, size_t size,
+                            alloc_context* acontext, uint32_t flags, heap_segment* seg,
+-- 
+2.32.0.windows.2
+
