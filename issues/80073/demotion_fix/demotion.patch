@@ -1,0 +1,562 @@
+diff --git a/src/coreclr/gc/gc.cpp b/src/coreclr/gc/gc.cpp
+index 41731d28dcb..b65f3284c22 100644
+--- a/src/coreclr/gc/gc.cpp
++++ b/src/coreclr/gc/gc.cpp
+@@ -50,6 +50,15 @@ public:
+ 
+ uint64_t gc_rand::x = 0;
+ 
++uint8_t* g_ptr = NULL;
++
++#pragma optimize("", off)
++void induce_av()
++{
++    printf("derefing null global ptr %d!!!\n", (int)(*g_ptr));
++}
++#pragma optimize("", on)
++
+ #if defined(BACKGROUND_GC) && defined(FEATURE_EVENT_TRACE)
+ BOOL bgc_heap_walk_for_etw_p = FALSE;
+ #endif //BACKGROUND_GC && FEATURE_EVENT_TRACE
+@@ -403,10 +412,25 @@ const size_t bgc_min_per_heap = 4*1024*1024;
+ int gc_heap::gchist_index = 0;
+ gc_mechanisms_store gc_heap::gchist[max_history_count];
+ 
++gc_heap::condemned_reason_info gc_heap::saved_ngc2_condemn_reasons[max_saved_ngc2_condemn_reasons_count];
++int gc_heap::current_saved_ngc2_condemn_reasons_index = 0;
++
++gc_heap::ngc2_index_info gc_heap::saved_ngc2_index_info[max_saved_ngc2_index_count];
++int gc_heap::current_saved_ngc2_index_info_index = 0;
++
+ #ifndef MULTIPLE_HEAPS
+ VOLATILE(bgc_state) gc_heap::current_bgc_state = bgc_not_in_process;
+ int gc_heap::gchist_index_per_heap = 0;
+ gc_heap::gc_history gc_heap::gchist_per_heap[max_history_count];
++
++gc_heap::condemned_reason_info_per_heap gc_heap::saved_ngc2_condemn_reasons_per_heap[max_saved_ngc2_condemn_reasons_count];
++int gc_heap::current_saved_ngc2_condemn_reasons_per_heap_index = 0;
++gc_heap::gen_plan_info gc_heap::saved_gen_plan_info[max_saved_gen_plan_info_count];
++int gc_heap::current_saved_gen_plan_info_index = 0;
++gc_heap::artificial_pinned_plug_info gc_heap::saved_art_pinned_plug_info[max_saved_art_plug_count];
++int gc_heap::current_saved_art_pinned_plug_index = 0;
++gc_heap::special_sweep_info gc_heap::saved_special_sweep_info[max_saved_special_sweep_count];
++int gc_heap::current_saved_special_sweep_index = 0;
+ #endif //MULTIPLE_HEAPS
+ #endif //BACKGROUND_GC
+ 
+@@ -455,6 +479,54 @@ void gc_heap::add_to_history()
+ #endif //GC_HISTORY && BACKGROUND_GC
+ }
+ 
++#pragma optimize("", off)
++void gc_heap::add_to_ngc2_condemned_per_heap()
++{
++    condemned_reason_info_per_heap* current_condemned_reason = &saved_ngc2_condemn_reasons_per_heap[current_saved_ngc2_condemn_reasons_per_heap_index];
++    current_condemned_reason->gc_index = VolatileLoadWithoutBarrier(&settings.gc_index);
++    current_condemned_reason->reasons = gen_to_condemn_reasons;
++    current_condemned_reason->trigger_reason = settings.reason;
++#ifdef MULTIPLE_HEAPS
++    current_condemned_reason->hn = heap_number;
++#else
++    current_condemned_reason->hn = 0;
++#endif //MULTIPLE_HEAPS
++
++    current_saved_ngc2_condemn_reasons_per_heap_index++;
++    if (current_saved_ngc2_condemn_reasons_per_heap_index == max_saved_ngc2_condemn_reasons_count)
++    {
++        current_saved_ngc2_condemn_reasons_per_heap_index = 0;
++    }
++}
++
++void gc_heap::add_to_ngc2_condemned()
++{
++    condemned_reason_info* current_condemned_reason = &saved_ngc2_condemn_reasons[current_saved_ngc2_condemn_reasons_index];
++    current_condemned_reason->gc_index = VolatileLoadWithoutBarrier(&settings.gc_index);
++    current_condemned_reason->reasons = gc_data_global.gen_to_condemn_reasons;
++    current_condemned_reason->trigger_reason = settings.reason;
++
++    current_saved_ngc2_condemn_reasons_index++;
++    if (current_saved_ngc2_condemn_reasons_index == max_saved_ngc2_condemn_reasons_count)
++    {
++        current_saved_ngc2_condemn_reasons_index = 0;
++    }
++}
++
++void gc_heap::add_to_ngc2_index_info (gc_type type)
++{
++    ngc2_index_info* current_ngc2_index_info = &saved_ngc2_index_info[current_saved_ngc2_index_info_index];
++    current_ngc2_index_info->gc_index = VolatileLoadWithoutBarrier(&settings.gc_index);
++    current_ngc2_index_info->type = type;
++
++    current_saved_ngc2_index_info_index++;
++    if (current_saved_ngc2_index_info_index == max_saved_ngc2_index_count)
++    {
++        current_saved_ngc2_index_info_index = 0;
++    }
++}
++#pragma optimize("", on)
++
+ #ifdef TRACE_GC
+ BOOL   gc_log_on = TRUE;
+ FILE* gc_log = NULL;
+@@ -14323,6 +14395,15 @@ gc_heap::init_gc_heap (int h_number)
+ 
+ #ifdef USE_REGIONS
+     special_sweep_p = false;
++
++    memset(saved_ngc2_condemn_reasons_per_heap, 0, sizeof(saved_ngc2_condemn_reasons_per_heap));
++    current_saved_ngc2_condemn_reasons_per_heap_index = 0;
++    memset(saved_gen_plan_info, 0, sizeof(saved_gen_plan_info));
++    current_saved_gen_plan_info_index = 0;
++    memset(saved_art_pinned_plug_info, 0, sizeof(saved_art_pinned_plug_info));
++    current_saved_art_pinned_plug_index = 0;
++    memset(saved_special_sweep_info, 0, sizeof(saved_special_sweep_info));
++    current_saved_special_sweep_index = 0;
+ #endif //USE_REGIONS
+ 
+ #endif //MULTIPLE_HEAPS
+@@ -20021,6 +20102,12 @@ int gc_heap::joined_generation_to_condemn (BOOL should_evaluate_elevation,
+     }
+ #endif //BACKGROUND_GC
+ 
++
++    if ((n == max_generation) && (!gc_can_use_concurrent || *blocking_collection_p))
++    {
++        add_to_ngc2_condemned();
++    }
++
+     return n;
+ }
+ 
+@@ -20909,6 +20996,11 @@ exit:
+         }
+     }
+ 
++    if ((n == max_generation) && (!gc_can_use_concurrent || *blocking_collection_p))
++    {
++        add_to_ngc2_condemned_per_heap();
++    }
++
+     return n;
+ }
+ 
+@@ -28646,6 +28738,22 @@ void gc_heap::process_last_np_surv_region (generation* consing_gen,
+                         dprintf (REGIONS_LOG, ("h%d couldn't get a region to plan gen0, special sweep on",
+                             heap_number));
+                         special_sweep_p = true;
++
++                        {
++                            special_sweep_info* current_special_sweep_info = &saved_special_sweep_info[current_saved_special_sweep_index];
++                            current_special_sweep_info->gc_index = VolatileLoadWithoutBarrier (&settings.gc_index);
++                            current_special_sweep_info->current_committed = current_total_committed;
++                            current_special_sweep_info->local_uoh_free_list_size = free_regions[large_free_region].get_size_free_regions() +
++                                                                                   free_regions[huge_free_region].get_size_free_regions();
++                            current_special_sweep_info->global_huge_free_list_size = global_free_huge_regions.get_size_free_regions();
++                            current_special_sweep_info->current_va_memory_load = global_region_allocator.get_va_memory_load();
++
++                            current_saved_special_sweep_index++;
++                            if (current_saved_special_sweep_index == max_saved_special_sweep_count)
++                            {
++                                current_saved_special_sweep_index = 0;
++                            }
++                        }
+                     }
+                 }
+                 else
+@@ -28771,7 +28879,9 @@ void gc_heap::process_remaining_regions (int current_plan_gen_num, generation* c
+         return;
+     }
+ 
+-    set_region_plan_gen_num_sip (current_region, current_plan_gen_num);
++    //set_region_plan_gen_num_sip (current_region, current_plan_gen_num);
++    decide_on_demotion_pin_surv (current_region);
++
+     if (!heap_segment_swept_in_plan (current_region))
+     {
+         heap_segment_plan_allocated (current_region) = generation_allocation_pointer (consing_gen);
+@@ -29245,6 +29355,8 @@ void gc_heap::plan_phase (int condemned_gen_number)
+     memset (sip_maxgen_regions_per_gen, 0, sizeof (sip_maxgen_regions_per_gen));
+     memset (reserved_free_regions_sip, 0, sizeof (reserved_free_regions_sip));
+     int pinned_survived_region = 0;
++    int pinned_plug_count_region = 0;
++    int art_pinned_plug_count_region = 0;
+     uint8_t** mark_list_index = nullptr;
+     uint8_t** mark_list_next = nullptr;
+     if (use_mark_list)
+@@ -29484,6 +29596,13 @@ void gc_heap::plan_phase (int condemned_gen_number)
+     saved_pinned_plug_index = INVALID_SAVED_PINNED_PLUG_INDEX;
+ #endif //DOUBLY_LINKED_FL
+ 
++    bool is_gen2_gc = (settings.condemned_generation == max_generation);
++    if (is_gen2_gc)
++    {
++        memset(saved_art_pinned_plug_info, 0, sizeof(saved_art_pinned_plug_info));
++        current_saved_art_pinned_plug_index = 0;
++    }
++
+     while (1)
+     {
+         if (x >= end)
+@@ -29519,9 +29638,13 @@ void gc_heap::plan_phase (int condemned_gen_number)
+ 
+ #ifdef USE_REGIONS
+             heap_segment_pinned_survived (seg1) = pinned_survived_region;
++            heap_segment_pinned_plug_count (seg1) = pinned_plug_count_region;
++            heap_segment_art_pinned_plug_count(seg1) = art_pinned_plug_count_region;
+             dprintf (REGIONS_LOG, ("h%d setting seg %Ix pin surv: %Ix",
+                 heap_number, heap_segment_mem (seg1), pinned_survived_region));
+             pinned_survived_region = 0;
++            pinned_plug_count_region = 0;
++            art_pinned_plug_count_region = 0;
+             if (heap_segment_mem (seg1) == heap_segment_allocated (seg1))
+             {
+                 num_regions_freed_in_sweep++;
+@@ -29755,6 +29878,15 @@ void gc_heap::plan_phase (int condemned_gen_number)
+ 
+                         convert_to_pinned_plug (last_npinned_plug_p, last_pinned_plug_p, pinned_plug_p,
+                                                 ps, artificial_pinned_size);
++
++                        art_pinned_plug_count_region++;
++                        if (is_gen2_gc && (current_saved_art_pinned_plug_index < max_saved_art_plug_count))
++                        {
++                            saved_art_pinned_plug_info[current_saved_art_pinned_plug_index].start = plug_start;
++                            saved_art_pinned_plug_info[current_saved_art_pinned_plug_index].len = (int)ps;
++                            saved_art_pinned_plug_info[current_saved_art_pinned_plug_index].artificial_reason = artificial_pinned_plug_large;
++                            current_saved_art_pinned_plug_index++;
++                        }
+                     }
+                 }
+             }
+@@ -29856,6 +29988,15 @@ void gc_heap::plan_phase (int condemned_gen_number)
+                                             ps, artificial_pinned_size);
+                     enque_pinned_plug (plug_start, FALSE, 0);
+                     last_pinned_plug = plug_start;
++
++                    art_pinned_plug_count_region++;
++                    if (is_gen2_gc && (current_saved_art_pinned_plug_index < max_saved_art_plug_count))
++                    {
++                        saved_art_pinned_plug_info[current_saved_art_pinned_plug_index].start = plug_start;
++                        saved_art_pinned_plug_info[current_saved_art_pinned_plug_index].len = (int)ps;
++                        saved_art_pinned_plug_info[current_saved_art_pinned_plug_index].artificial_reason = artificial_pinned_plug_near_next;
++                        current_saved_art_pinned_plug_index++;
++                    }
+                 }
+                 else
+                 {
+@@ -29922,6 +30063,7 @@ void gc_heap::plan_phase (int condemned_gen_number)
+                 size_t pinned_plug_size = plug_end - plug_start;
+ #ifdef USE_REGIONS
+                 pinned_survived_region += (int)pinned_plug_size;
++                pinned_plug_count_region++;
+ #endif //USE_REGIONS
+ 
+                 dd_pinned_survived_size (dd_active_old) += pinned_plug_size;
+@@ -30096,6 +30238,48 @@ void gc_heap::plan_phase (int condemned_gen_number)
+     plan_generation_starts (consing_gen);
+ #endif //!USE_REGIONS
+ 
++#ifdef USE_REGIONS
++    if (is_gen2_gc)
++    {
++        bool large_pinned_surv_demotion_p = false;
++        current_saved_gen_plan_info_index = 0;
++        // AV if we detected we demoted a region with large amount of pinned surv
++        for (int gen_idx = max_generation; gen_idx >= 0; gen_idx--)
++        {
++            heap_segment* soh_region = heap_segment_rw (generation_start_segment (generation_of (gen_idx)));
++            while (soh_region)
++            {
++                if (heap_segment_plan_gen_num (soh_region) == 0)
++                {
++                    gen_plan_info* current_gen_plan_info = &saved_gen_plan_info[current_saved_gen_plan_info_index];
++                    current_gen_plan_info->region = soh_region;
++                    current_gen_plan_info->pinned_survived = heap_segment_pinned_survived(soh_region);
++                    current_gen_plan_info->gen_num = heap_segment_gen_num(soh_region);
++                    current_gen_plan_info->plan_gen_num = heap_segment_plan_gen_num(soh_region);
++
++                    if (current_gen_plan_info->pinned_survived > (1024 * 1024))
++                    {
++                        large_pinned_surv_demotion_p = true;
++                    }
++
++                    current_saved_gen_plan_info_index++;
++                    if (current_saved_gen_plan_info_index == max_saved_gen_plan_info_count)
++                    {
++                        current_saved_gen_plan_info_index = 0;
++                    }
++                }
++
++                soh_region = heap_segment_next(soh_region);
++            }
++        }
++
++        if (settings.promotion && large_pinned_surv_demotion_p)
++        {
++            induce_av();
++        }
++    }
++#endif //USE_REGIONS
++
+     descr_generations ("AP");
+ 
+     print_free_and_plug ("AP");
+@@ -30407,6 +30591,7 @@ void gc_heap::plan_phase (int condemned_gen_number)
+             {
+                 full_gc_counts[gc_type_compacting]++;
+                 is_full_compacting_gc = TRUE;
++                add_to_ngc2_index_info (gc_type_compacting);
+             }
+ 
+             for (i = 0; i < n_heaps; i++)
+@@ -30483,6 +30668,7 @@ void gc_heap::plan_phase (int condemned_gen_number)
+         if (should_compact && (condemned_gen_number == max_generation))
+         {
+             full_gc_counts[gc_type_compacting]++;
++            add_to_ngc2_index_info (gc_type_compacting);
+             loh_alloc_since_cg = 0;
+         }
+     }
+@@ -30494,6 +30680,17 @@ void gc_heap::plan_phase (int condemned_gen_number)
+         gc_time_info[time_plan] = gc_time_info[time_sweep] - gc_time_info[time_plan];
+     }
+ #endif //FEATURE_EVENT_TRACE
++
++#ifdef USE_REGIONS
++    if (special_sweep_p)
++    {
++        should_compact = FALSE;
++        if (condemned_gen_number == max_generation)
++        {
++            add_to_ngc2_index_info(gc_type_sweeping);
++        }
++    }
++#endif //USE_REGIONS
+ #endif //MULTIPLE_HEAPS
+ 
+ #ifdef FEATURE_LOH_COMPACTION
+@@ -31493,6 +31690,23 @@ void gc_heap::thread_final_regions (bool compact_p)
+     }
+ 
+     verify_regions (true, false);
++
++#ifdef USE_REGIONS
++    // If there's a full compacting GC and there are gen0 regions that have very high pinned survived, induce an AV.
++    if ((settings.condemned_generation == max_generation) && compact_p && settings.promotion)
++    {
++        heap_segment* gen0_region = generation_start_segment (generation_of (0));
++        while (gen0_region)
++        {
++            if (heap_segment_pinned_survived (gen0_region) > (1024 * 1024))
++            {
++                induce_av();
++            }
++
++            gen0_region = heap_segment_next (gen0_region);
++        }
++    }
++#endif //USE_REGIONS
+ }
+ 
+ void gc_heap::thread_start_region (generation* gen, heap_segment* region)
+@@ -46651,6 +46865,7 @@ void gc_heap::do_pre_gc()
+         if (settings.condemned_generation == max_generation)
+         {
+             full_gc_counts[gc_type_blocking]++;
++            add_to_ngc2_index_info (gc_type_blocking);
+         }
+         else
+         {
+diff --git a/src/coreclr/gc/gcpriv.h b/src/coreclr/gc/gcpriv.h
+index dac6e3dbd32..2f562b5a6d5 100644
+--- a/src/coreclr/gc/gcpriv.h
++++ b/src/coreclr/gc/gcpriv.h
+@@ -52,7 +52,7 @@ inline void FATAL_GC_ERROR()
+ // This means any empty regions can be freely used for any generation. For
+ // Server GC we will balance regions between heaps.
+ // For now disable regions for StandAlone GC, NativeAOT and MacOS builds
+-#if defined (HOST_64BIT) && !defined (BUILD_AS_STANDALONE) && !defined(__APPLE__) && !defined(FEATURE_NATIVEAOT)
++#if defined (HOST_64BIT) && defined (BUILD_AS_STANDALONE) && !defined(__APPLE__) && !defined(FEATURE_NATIVEAOT)
+ #define USE_REGIONS
+ #endif //HOST_64BIT && BUILD_AS_STANDALONE
+ 
+@@ -486,7 +486,8 @@ enum gc_type
+ #ifdef BACKGROUND_GC
+     gc_type_background = 2,
+ #endif //BACKGROUND_GC
+-    gc_type_max = 3
++    gc_type_sweeping = 3,
++    gc_type_max = 4
+ };
+ 
+ //encapsulates the mechanism for the current gc
+@@ -4358,6 +4359,7 @@ protected:
+     PER_HEAP
+     int gchist_index_per_heap;
+ 
++    // only recording this for blocking GCs
+     PER_HEAP
+     gc_history gchist_per_heap[max_history_count];
+ 
+@@ -4367,6 +4369,113 @@ protected:
+     PER_HEAP_ISOLATED
+     gc_mechanisms_store gchist[max_history_count];
+ 
++    struct condemned_reason_info_per_heap
++    {
++        size_t gc_index;
++        gen_to_condemn_tuning reasons;
++        uint32_t trigger_reason;
++        int hn;
++    };
++
++    struct condemned_reason_info
++    {
++        size_t gc_index;
++        gen_to_condemn_tuning reasons;
++        uint32_t trigger_reason;
++    };
++
++#define max_saved_ngc2_condemn_reasons_count 64
++    PER_HEAP
++    condemned_reason_info_per_heap saved_ngc2_condemn_reasons_per_heap[max_saved_ngc2_condemn_reasons_count];
++
++    PER_HEAP
++    int current_saved_ngc2_condemn_reasons_per_heap_index;
++
++    PER_HEAP_ISOLATED
++    condemned_reason_info saved_ngc2_condemn_reasons[max_saved_ngc2_condemn_reasons_count];
++
++    PER_HEAP_ISOLATED
++    int current_saved_ngc2_condemn_reasons_index;
++
++    PER_HEAP
++    void add_to_ngc2_condemned_per_heap();
++
++    PER_HEAP_ISOLATED
++    void add_to_ngc2_condemned();
++
++    struct ngc2_index_info
++    {
++        size_t gc_index;
++        gc_type type;
++    };
++#define max_saved_ngc2_index_count 128
++    PER_HEAP_ISOLATED
++    ngc2_index_info saved_ngc2_index_info[max_saved_ngc2_index_count];
++
++    PER_HEAP_ISOLATED
++    int current_saved_ngc2_index_info_index;
++
++    PER_HEAP_ISOLATED
++    void add_to_ngc2_index_info(gc_type type);
++
++#ifdef USE_REGIONS
++    struct gen_plan_info
++    {
++        heap_segment* region;
++        int pinned_survived;
++        int gen_num;
++        int plan_gen_num;
++    };
++
++#define max_saved_gen_plan_info_count 64
++    // after plan phase if there's any soh region that gets planed to 0, record it
++    // use as a circular buffer so we can record the last few regions that did this
++    // only do this during a gen2 blocking GC.
++    PER_HEAP
++    gen_plan_info saved_gen_plan_info[max_saved_gen_plan_info_count];
++
++    PER_HEAP
++    int current_saved_gen_plan_info_index;
++
++    enum artificial_pinned_plug_reason
++    {
++        not_artificial_pinned_plug,
++        artificial_pinned_plug_large,
++        artificial_pinned_plug_near_next
++    };
++
++    struct artificial_pinned_plug_info
++    {
++        uint8_t* start;
++        int len;
++        int artificial_reason;
++    };
++
++#define max_saved_art_plug_count 1024
++
++    PER_HEAP
++    artificial_pinned_plug_info saved_art_pinned_plug_info[max_saved_art_plug_count];
++    PER_HEAP
++    int current_saved_art_pinned_plug_index;
++
++    // when we turn on special_sweep_p, what's the situation?
++    struct special_sweep_info
++    {
++        size_t gc_index;
++        size_t current_committed;
++        size_t local_uoh_free_list_size;
++        size_t global_huge_free_list_size;
++        uint32_t current_va_memory_load;
++    };
++
++#define max_saved_special_sweep_count 64
++    PER_HEAP
++    special_sweep_info saved_special_sweep_info[max_saved_special_sweep_count];
++    PER_HEAP
++    int current_saved_special_sweep_index;
++
++#endif //USE_REGIONS
++
+     PER_HEAP
+     size_t     bgc_overflow_count;
+ 
+@@ -5751,6 +5860,8 @@ public:
+     int             survived;
+     int             old_card_survived;
+     int             pinned_survived;
++    int             pinned_plug_count;
++    int             art_pinned_plug_count;
+     // at the end of each GC, we increase each region in the region free list
+     // by 1. So we can observe if a region stays in the free list over many
+     // GCs. We stop at 99. It's initialized to 0 when a region is added to
+@@ -6202,6 +6313,16 @@ int& heap_segment_pinned_survived (heap_segment* inst)
+     return inst->pinned_survived;
+ }
+ inline
++int& heap_segment_pinned_plug_count(heap_segment* inst)
++{
++    return inst->pinned_plug_count;
++}
++inline
++int& heap_segment_art_pinned_plug_count(heap_segment* inst)
++{
++    return inst->art_pinned_plug_count;
++}
++inline
+ uint8_t* heap_segment_free_list_head (heap_segment* inst)
+ {
+     return inst->free_list_head;
+diff --git a/src/tests/GC/Stress/Framework/ReliabilityFramework.cs b/src/tests/GC/Stress/Framework/ReliabilityFramework.cs
+index 1b6e21499c4..094d33235f3 100644
+--- a/src/tests/GC/Stress/Framework/ReliabilityFramework.cs
++++ b/src/tests/GC/Stress/Framework/ReliabilityFramework.cs
+@@ -1344,12 +1344,12 @@ WeakReference UnloadAssemblyLoadContextInner(ReliabilityTest test)
+     void UnloadAssemblyLoadContext(ReliabilityTest test)
+     {
+         WeakReference alcWeakRef = UnloadAssemblyLoadContextInner(test);
+-        for (int i = 0; (i < 8) && alcWeakRef.IsAlive; i++)
+-        {
+-            GC.Collect();
+-            GC.WaitForPendingFinalizers();
+-            GC.Collect();
+-        }
++        //for (int i = 0; (i < 8) && alcWeakRef.IsAlive; i++)
++        //{
++        //    GC.Collect();
++        //    GC.WaitForPendingFinalizers();
++        //    GC.Collect();
++        //}
+ 
+         if (alcWeakRef.IsAlive)
+         {
