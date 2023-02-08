@@ -1,0 +1,327 @@
+diff --git a/src/coreclr/gc/gc.cpp b/src/coreclr/gc/gc.cpp
+index b65f3284c22..98136d7dbc4 100644
+--- a/src/coreclr/gc/gc.cpp
++++ b/src/coreclr/gc/gc.cpp
+@@ -2403,12 +2403,7 @@ size_t      gc_heap::heap_hard_limit = 0;
+ size_t      gc_heap::heap_hard_limit_oh[total_oh_count];
+ 
+ #ifdef USE_REGIONS
+-
+ size_t      gc_heap::regions_range = 0;
+-
+-size_t      gc_heap::heap_hard_limit_for_heap = 0;
+-size_t      gc_heap::heap_hard_limit_for_bookkeeping = 0;
+-
+ #endif //USE_REGIONS
+ 
+ bool        affinity_config_specified_p = false;
+@@ -4043,6 +4038,8 @@ bool region_allocator::allocate_large_region (uint8_t** start, uint8_t** end, al
+     return allocate_region (size, start, end, direction, fn);
+ }
+ 
++// Whenever a region is deleted, it is expected that the memory and the mark array
++// of the region is decommitted already.
+ void region_allocator::delete_region (uint8_t* region_start)
+ {
+     enter_spin_lock();
+@@ -7014,10 +7011,6 @@ bool gc_heap::virtual_commit (void* address, size_t size, int bucket, int h_numb
+ 
+         if (heap_hard_limit_oh[soh] != 0)
+         {
+-#ifdef USE_REGIONS
+-            assert (heap_hard_limit_for_heap == 0);
+-            assert (heap_hard_limit_for_bookkeeping == 0);
+-#endif //USE_REGIONS
+             if ((bucket < total_oh_count) && (committed_by_oh[bucket] + size) > heap_hard_limit_oh[bucket])
+             {
+                 exceeded_p = true;
+@@ -7025,23 +7018,8 @@ bool gc_heap::virtual_commit (void* address, size_t size, int bucket, int h_numb
+         }
+         else
+         {
+-            size_t base;
+-            size_t limit;
+-#ifdef USE_REGIONS
+-            if (h_number < 0)
+-            {
+-                base = current_total_committed_bookkeeping;
+-                limit = heap_hard_limit_for_bookkeeping;
+-            }
+-            else
+-            {
+-                base = current_total_committed - current_total_committed_bookkeeping;
+-                limit = heap_hard_limit_for_heap;
+-            }
+-#else
+-            base = current_total_committed;
+-            limit = heap_hard_limit;
+-#endif //USE_REGIONS
++            size_t base = current_total_committed;
++            size_t limit = heap_hard_limit;
+             if ((base + size) > limit)
+             {
+                 dprintf (1, ("%Id + %Id = %Id > limit %Id ", base, size, (base + size), limit));
+@@ -11352,12 +11330,6 @@ void gc_heap::clear_region_info (heap_segment* region)
+                         seg_deleted);
+ 
+     bgc_verify_mark_array_cleared (region);
+-
+-    if (dt_high_memory_load_p())
+-    {
+-        decommit_mark_array_by_seg (region);
+-        region->flags &= ~(heap_segment_flags_ma_committed);
+-    }
+ #endif //BACKGROUND_GC
+ }
+ 
+@@ -13670,26 +13642,6 @@ HRESULT gc_heap::initialize_gc (size_t soh_segment_size,
+ #endif //BACKGROUND_GC
+ #endif //WRITE_WATCH
+ 
+-#ifdef USE_REGIONS
+-    if (gc_heap::heap_hard_limit && gc_heap::heap_hard_limit_oh[soh] == 0)
+-    {
+-        size_t gc_region_size = (size_t)1 << min_segment_size_shr;
+-        size_t sizes[total_bookkeeping_elements];
+-        size_t bookkeeping_size_per_region = 0;
+-        uint8_t* temp_lowest_address = (uint8_t*)gc_region_size;
+-        gc_heap::get_card_table_element_sizes(temp_lowest_address, temp_lowest_address + gc_region_size, sizes);
+-        for (int i = 0; i < total_bookkeeping_elements; i++)
+-        {
+-            bookkeeping_size_per_region += sizes[i];
+-        }
+-        size_t total_size_per_region = gc_region_size + bookkeeping_size_per_region;
+-        size_t max_region_count = gc_heap::heap_hard_limit / total_size_per_region; // implictly rounded down
+-        gc_heap::heap_hard_limit_for_heap = max_region_count * gc_region_size;
+-        gc_heap::heap_hard_limit_for_bookkeeping = max_region_count * bookkeeping_size_per_region;
+-        dprintf (REGIONS_LOG, ("bookkeeping_size_per_region = %Id", bookkeeping_size_per_region));
+-    }
+-#endif //USE_REGIONS
+-
+ #ifdef BACKGROUND_GC
+     // leave the first page to contain only segment info
+     // because otherwise we could need to revisit the first page frequently in
+@@ -14450,6 +14402,9 @@ gc_heap::init_gc_heap (int h_number)
+ #endif //CARD_BUNDLE
+ 
+ #ifdef BACKGROUND_GC
++    background_saved_highest_address = nullptr;
++    background_saved_lowest_address = nullptr;
++
+     if (gc_can_use_concurrent)
+         mark_array = translate_mark_array (card_table_mark_array (&g_gc_card_table[card_word (card_of (g_gc_lowest_address))]));
+     else
+@@ -20376,25 +20331,22 @@ bool gc_heap::try_get_new_free_region()
+ bool gc_heap::init_table_for_region (int gen_number, heap_segment* region)
+ {
+ #ifdef BACKGROUND_GC
+-        if (is_bgc_in_progress())
+-        {
+-            dprintf (GC_TABLE_LOG, ("new seg %Ix, mark_array is %Ix",
+-                heap_segment_mem (region), mark_array));
+-            if (((region->flags & heap_segment_flags_ma_committed) == 0) &&
+-                !commit_mark_array_new_seg (__this, region))
+-            {
+-                dprintf (GC_TABLE_LOG, ("failed to commit mark array for the new region %Ix-%Ix",
+-                    get_region_start (region), heap_segment_reserved (region)));
++    dprintf (GC_TABLE_LOG, ("new seg %Ix, mark_array is %Ix",
++        heap_segment_mem (region), mark_array));
++    if (((region->flags & heap_segment_flags_ma_committed) == 0) &&
++        !commit_mark_array_new_seg (__this, region))
++    {
++        dprintf (GC_TABLE_LOG, ("failed to commit mark array for the new region %Ix-%Ix",
++            get_region_start (region), heap_segment_reserved (region)));
+ 
+-                // We don't have memory to commit the mark array so we cannot use the new region.
+-                global_region_allocator.delete_region (get_region_start (region));
+-                return false;
+-            }
+-        }
+-        if ((region->flags & heap_segment_flags_ma_committed) != 0)
+-        {
+-            bgc_verify_mark_array_cleared (region, true);
+-        }
++        // We don't have memory to commit the mark array so we cannot use the new region.
++        decommit_region (region, gen_to_oh (gen_number), heap_number);
++        return false;
++    }
++    if ((region->flags & heap_segment_flags_ma_committed) != 0)
++    {
++        bgc_verify_mark_array_cleared (region, true);
++    }
+ #endif //BACKGROUND_GC
+ 
+     if (gen_number <= max_generation)
+@@ -28743,9 +28695,12 @@ void gc_heap::process_last_np_surv_region (generation* consing_gen,
+                             special_sweep_info* current_special_sweep_info = &saved_special_sweep_info[current_saved_special_sweep_index];
+                             current_special_sweep_info->gc_index = VolatileLoadWithoutBarrier (&settings.gc_index);
+                             current_special_sweep_info->current_committed = current_total_committed;
+-                            current_special_sweep_info->local_uoh_free_list_size = free_regions[large_free_region].get_size_free_regions() +
+-                                                                                   free_regions[huge_free_region].get_size_free_regions();
+-                            current_special_sweep_info->global_huge_free_list_size = global_free_huge_regions.get_size_free_regions();
++                            current_special_sweep_info->local_uoh_free_list_size = free_regions[large_free_region].get_size_committed_in_free() +
++                                                                                   free_regions[huge_free_region].get_size_committed_in_free();
++                            current_special_sweep_info->global_huge_free_list_size = global_free_huge_regions.get_size_committed_in_free();
++                            current_special_sweep_info->global_decommit_size = global_regions_to_decommit[basic_free_region].get_size_committed_in_free() +
++                                                                               global_regions_to_decommit[large_free_region].get_size_committed_in_free() +
++                                                                               global_regions_to_decommit[huge_free_region].get_size_committed_in_free();
+                             current_special_sweep_info->current_va_memory_load = global_region_allocator.get_va_memory_load();
+ 
+                             current_saved_special_sweep_index++;
+@@ -41160,36 +41115,12 @@ bool gc_heap::decommit_step (uint64_t step_milliseconds)
+     const size_t max_decommit_step_size = DECOMMIT_SIZE_PER_MILLISECOND * step_milliseconds;
+     for (int kind = basic_free_region; kind < count_free_region_kinds; kind++)
+     {
+-        dprintf (REGIONS_LOG, ("decommit_step %d, regions_to_decommit = %Id",
++        dprintf (REGIONS_LOG, ("decommit_step %d, regions_to_decommit = %zd",
+             kind, global_regions_to_decommit[kind].get_num_free_regions()));
+         while (global_regions_to_decommit[kind].get_num_free_regions() > 0)
+         {
+             heap_segment* region = global_regions_to_decommit[kind].unlink_region_front();
+-
+-            uint8_t* page_start = align_lower_page(get_region_start(region));
+-            uint8_t* end = use_large_pages_p ? heap_segment_used(region) : heap_segment_committed(region);
+-            size_t size = end - page_start;
+-            bool decommit_succeeded_p = false;
+-            if (!use_large_pages_p)
+-            {
+-                decommit_succeeded_p = virtual_decommit(page_start, size, recorded_committed_free_bucket);
+-                dprintf(REGIONS_LOG, ("decommitted region %Ix(%Ix-%Ix) (%Iu bytes) - success: %d",
+-                    region,
+-                    page_start,
+-                    end,
+-                    size,
+-                    decommit_succeeded_p));
+-            }
+-            if (!decommit_succeeded_p)
+-            {
+-                memclr(page_start, size);
+-                dprintf(REGIONS_LOG, ("cleared region %Ix(%Ix-%Ix) (%Iu bytes)",
+-                    region,
+-                    page_start,
+-                    end,
+-                    size));
+-            }
+-            global_region_allocator.delete_region(get_region_start(region));
++            size_t size = decommit_region (region, recorded_committed_free_bucket, -1);
+             decommit_size += size;
+             if (decommit_size >= max_decommit_step_size)
+             {
+@@ -41216,6 +41147,68 @@ bool gc_heap::decommit_step (uint64_t step_milliseconds)
+     return (decommit_size != 0);
+ }
+ 
++#ifdef USE_REGIONS
++size_t gc_heap::decommit_region (heap_segment* region, int bucket, int h_number)
++{
++    uint8_t* page_start = align_lower_page (get_region_start (region));
++    uint8_t* end = use_large_pages_p ? heap_segment_used (region) : heap_segment_committed (region);
++    size_t size = end - page_start;
++    bool decommit_succeeded_p = false;
++    if (!use_large_pages_p)
++    {
++        decommit_succeeded_p = virtual_decommit (page_start, size, bucket, h_number);
++    }
++    dprintf (REGIONS_LOG, ("decommitted region %p(%p-%p) (%zu bytes) - success: %d",
++        region,
++        page_start,
++        end,
++        size,
++        decommit_succeeded_p));
++    if (decommit_succeeded_p)
++    {
++        heap_segment_committed (region) = heap_segment_mem (region);
++    }
++    else
++    {
++        memclr (page_start, size);
++        heap_segment_used (region) = heap_segment_mem (region);
++        dprintf(REGIONS_LOG, ("cleared region %p(%p-%p) (%zu bytes)",
++            region,
++            page_start,
++            end,
++            size));
++    }
++
++    // Under USE_REGIONS, mark array is never partially committed. So we are only checking for this
++    // flag here.
++    if ((region->flags & heap_segment_flags_ma_committed) != 0)
++    {
++#ifdef MULTIPLE_HEAPS
++        // In return_free_region, we set heap_segment_heap (region) to nullptr so we cannot use it here.
++        // but since all heaps share the same mark array we simply pick the 0th heap to use. 
++        gc_heap* hp = g_heaps [0];
++#else
++        gc_heap* hp = pGenGCHeap;
++#endif
++        hp->decommit_mark_array_by_seg (region);
++        region->flags &= ~(heap_segment_flags_ma_committed);
++    }
++
++    if (use_large_pages_p)
++    {
++        assert (heap_segment_used (region) == heap_segment_mem (region));
++    }
++    else
++    {
++        assert (heap_segment_committed (region) == heap_segment_mem (region));
++    }
++    assert ((region->flags & heap_segment_flags_ma_committed) == 0);
++    global_region_allocator.delete_region (get_region_start (region));
++
++    return size;
++}
++#endif //USE_REGIONS
++
+ #ifdef MULTIPLE_HEAPS
+ // return the decommitted size
+ size_t gc_heap::decommit_ephemeral_segment_pages_step ()
+@@ -46796,6 +46789,12 @@ void gc_heap::do_pre_gc()
+ {
+     STRESS_LOG_GC_STACK;
+ 
++    if (!settings.concurrent && (settings.condemned_generation == max_generation))
++    {
++        full_gc_counts[gc_type_blocking]++;
++        add_to_ngc2_index_info(gc_type_blocking);
++    }
++
+ #ifdef STRESS_LOG
+     STRESS_LOG_GC_START(VolatileLoad(&settings.gc_index),
+                         (uint32_t)settings.condemned_generation,
+diff --git a/src/coreclr/gc/gcpriv.h b/src/coreclr/gc/gcpriv.h
+index 2f562b5a6d5..bc42f445001 100644
+--- a/src/coreclr/gc/gcpriv.h
++++ b/src/coreclr/gc/gcpriv.h
+@@ -2078,6 +2078,10 @@ protected:
+     size_t decommit_heap_segment_pages_worker (heap_segment* seg, uint8_t *new_committed);
+     PER_HEAP_ISOLATED
+     bool decommit_step (uint64_t step_milliseconds);
++#ifdef USE_REGIONS
++    PER_HEAP_ISOLATED
++    size_t decommit_region(heap_segment* region, int bucket, int h_number);
++#endif //USE_REGIONS
+     PER_HEAP
+     void decommit_heap_segment (heap_segment* seg);
+     PER_HEAP_ISOLATED
+@@ -4109,12 +4113,6 @@ public:
+     PER_HEAP_ISOLATED
+     size_t heap_hard_limit_oh[total_oh_count];
+ 
+-    PER_HEAP_ISOLATED
+-    size_t heap_hard_limit_for_heap;
+-
+-    PER_HEAP_ISOLATED
+-    size_t heap_hard_limit_for_bookkeeping;
+-
+     PER_HEAP_ISOLATED
+     CLRCriticalSection check_commit_cs;
+ 
+@@ -4465,6 +4463,7 @@ protected:
+         size_t current_committed;
+         size_t local_uoh_free_list_size;
+         size_t global_huge_free_list_size;
++        size_t global_decommit_size;
+         uint32_t current_va_memory_load;
+     };
+ 
